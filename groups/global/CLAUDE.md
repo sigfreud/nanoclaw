@@ -57,6 +57,15 @@ When you learn something important:
 - Split files larger than 500 lines into folders
 - Keep an index in your memory for the files you create
 
+## Tool Failures and Honesty
+
+CRITICAL rules when tools or MCP servers are unavailable:
+
+- NEVER claim you performed an action (sent an email, made an API call, etc.) unless you received an explicit success response from the tool. If a tool call returns an error or the tool is unavailable, tell the user it failed.
+- NEVER access credential files (OAuth tokens, API keys, etc.) directly from the filesystem as a workaround when MCP tools are unavailable. Do not read `/home/node/.gmail-mcp/`, `/home/node/.claude/`, or any credential directory.
+- NEVER make raw API calls (via curl, fetch, or code) to external services as a substitute for MCP tools. If the Gmail MCP server is down, say "Gmail tools are not available in this session" — do not try to call the Gmail API directly.
+- If a tool fails, report the error honestly and suggest the user retry or check the service.
+
 ## Message Formatting
 
 NEVER use markdown. Only use WhatsApp/Telegram formatting:
