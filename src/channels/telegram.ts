@@ -1,7 +1,10 @@
+import fs from 'fs';
 import https from 'https';
-import { Api, Bot } from 'grammy';
+import path from 'path';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { Api, Bot, InputFile } from 'grammy';
+
+import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -39,6 +42,95 @@ async function sendTelegramMessage(
     logger.debug({ err }, 'Markdown send failed, falling back to plain text');
     await api.sendMessage(chatId, text, options);
   }
+}
+
+const TELEGRAM_MAX_FILE_SIZE = 20 * 1024 * 1024; // 20MB bot API limit
+
+async function downloadTelegramFile(
+  botToken: string,
+  fileId: string,
+  destPath: string,
+): Promise<void> {
+  // Step 1: get file_path from Telegram
+  const fileInfo = await new Promise<{ file_path?: string }>(
+    (resolve, reject) => {
+      https
+        .get(
+          `https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`,
+          (res) => {
+            let data = '';
+            res.on('data', (chunk: Buffer) => (data += chunk.toString()));
+            res.on('end', () => {
+              try {
+                const json = JSON.parse(data);
+                if (json.ok) resolve(json.result);
+                else reject(new Error(json.description || 'getFile failed'));
+              } catch (e) {
+                reject(e);
+              }
+            });
+          },
+        )
+        .on('error', reject);
+    },
+  );
+
+  if (!fileInfo.file_path) {
+    throw new Error('No file_path in getFile response');
+  }
+
+  // Step 2: download the file
+  const url = `https://api.telegram.org/file/bot${botToken}/${fileInfo.file_path}`;
+  await new Promise<void>((resolve, reject) => {
+    https
+      .get(url, (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`Download failed: HTTP ${res.statusCode}`));
+          res.resume();
+          return;
+        }
+        const ws = fs.createWriteStream(destPath);
+        res.pipe(ws);
+        ws.on('finish', () => resolve());
+        ws.on('error', reject);
+      })
+      .on('error', reject);
+  });
+}
+
+function extractFileInfo(
+  ctx: any,
+): { fileId: string; fileName: string; fileSize?: number } | null {
+  const msg = ctx.message;
+  if (msg.photo && msg.photo.length > 0) {
+    const largest = msg.photo[msg.photo.length - 1];
+    return { fileId: largest.file_id, fileName: 'photo.jpg', fileSize: largest.file_size };
+  }
+  if (msg.document) {
+    return {
+      fileId: msg.document.file_id,
+      fileName: msg.document.file_name || 'document',
+      fileSize: msg.document.file_size,
+    };
+  }
+  if (msg.video) {
+    return {
+      fileId: msg.video.file_id,
+      fileName: msg.video.file_name || 'video.mp4',
+      fileSize: msg.video.file_size,
+    };
+  }
+  if (msg.voice) {
+    return { fileId: msg.voice.file_id, fileName: 'voice.ogg', fileSize: msg.voice.file_size };
+  }
+  if (msg.audio) {
+    return {
+      fileId: msg.audio.file_id,
+      fileName: msg.audio.file_name || 'audio.mp3',
+      fileSize: msg.audio.file_size,
+    };
+  }
+  return null;
 }
 
 export class TelegramChannel implements Channel {
@@ -165,8 +257,8 @@ export class TelegramChannel implements Channel {
       );
     });
 
-    // Handle non-text messages with placeholders so the agent knows something was sent
-    const storeNonText = (ctx: any, placeholder: string) => {
+    // Handle non-text messages: download attachments when possible, store with placeholders
+    const storeNonText = async (ctx: any, placeholder: string) => {
       const chatJid = `tg:${ctx.chat.id}`;
       const group = this.opts.registeredGroups()[chatJid];
       if (!group) return;
@@ -178,6 +270,32 @@ export class TelegramChannel implements Channel {
         ctx.from?.id?.toString() ||
         'Unknown';
       const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const msgId = ctx.message.message_id.toString();
+
+      let content = `${placeholder}${caption}`;
+
+      // Attempt to download the attachment
+      const fileInfo = extractFileInfo(ctx);
+      if (fileInfo) {
+        if (fileInfo.fileSize && fileInfo.fileSize > TELEGRAM_MAX_FILE_SIZE) {
+          content = `${placeholder} (file too large to download: ${Math.round(fileInfo.fileSize / 1024 / 1024)}MB)${caption}`;
+        } else {
+          try {
+            const sanitizedName = fileInfo.fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+            const attachDir = path.join(GROUPS_DIR, group.folder, 'attachments');
+            fs.mkdirSync(attachDir, { recursive: true });
+            const destFile = `${msgId}_${sanitizedName}`;
+            const destPath = path.join(attachDir, destFile);
+            await downloadTelegramFile(this.botToken, fileInfo.fileId, destPath);
+            const containerPath = `/workspace/group/attachments/${destFile}`;
+            content = `${placeholder} (saved to ${containerPath})${caption}`;
+            logger.info({ chatJid, file: destFile }, 'Telegram attachment downloaded');
+          } catch (err) {
+            logger.error({ chatJid, err }, 'Failed to download Telegram attachment');
+            // Fall through with original placeholder
+          }
+        }
+      }
 
       const isGroup =
         ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
@@ -189,11 +307,11 @@ export class TelegramChannel implements Channel {
         isGroup,
       );
       this.opts.onMessage(chatJid, {
-        id: ctx.message.message_id.toString(),
+        id: msgId,
         chat_jid: chatJid,
         sender: ctx.from?.id?.toString() || '',
         sender_name: senderName,
-        content: `${placeholder}${caption}`,
+        content,
         timestamp,
         is_from_me: false,
       });
@@ -289,6 +407,113 @@ export class TelegramChannel implements Channel {
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
+  }
+
+  async sendFile(jid: string, filePath: string, caption?: string): Promise<void> {
+    if (!this.bot) {
+      logger.warn('Telegram bot not initialized');
+      return;
+    }
+    try {
+      const numericId = jid.replace(/^tg:/, '');
+      await this.bot.api.sendDocument(numericId, new InputFile(filePath), {
+        caption,
+      });
+      logger.info({ jid, filePath }, 'Telegram file sent');
+    } catch (err) {
+      logger.error({ jid, filePath, err }, 'Failed to send Telegram file');
+    }
+  }
+}
+
+// Bot pool for agent teams: send-only Api instances (no polling)
+const poolApis: Api[] = [];
+// Maps "{groupFolder}:{senderName}" → pool Api index for stable assignment
+const senderBotMap = new Map<string, number>();
+let nextPoolIndex = 0;
+
+/**
+ * Initialize send-only Api instances for the bot pool.
+ * Each pool bot can send messages but doesn't poll for updates.
+ */
+export async function initBotPool(tokens: string[]): Promise<void> {
+  for (const token of tokens) {
+    try {
+      const api = new Api(token);
+      const me = await api.getMe();
+      poolApis.push(api);
+      logger.info(
+        { username: me.username, id: me.id, poolSize: poolApis.length },
+        'Pool bot initialized',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to initialize pool bot');
+    }
+  }
+  if (poolApis.length > 0) {
+    logger.info({ count: poolApis.length }, 'Telegram bot pool ready');
+  }
+}
+
+/**
+ * Send a message via a pool bot assigned to the given sender name.
+ * Assigns bots round-robin on first use; subsequent messages from the
+ * same sender in the same group always use the same bot.
+ * On first assignment, renames the bot to match the sender's role.
+ */
+export async function sendPoolMessage(
+  chatId: string,
+  text: string,
+  sender: string,
+  groupFolder: string,
+): Promise<void> {
+  if (poolApis.length === 0) {
+    // No pool bots — fall back to main bot
+    // Can't call sendMessage on TelegramChannel instance here,
+    // so we just log a warning
+    logger.warn('No pool bots available, sender identity will be lost');
+    return;
+  }
+
+  const key = `${groupFolder}:${sender}`;
+  let idx = senderBotMap.get(key);
+  if (idx === undefined) {
+    idx = nextPoolIndex % poolApis.length;
+    nextPoolIndex++;
+    senderBotMap.set(key, idx);
+    // Rename the bot to match the sender's role, then wait for Telegram to propagate
+    try {
+      await poolApis[idx].setMyName(sender);
+      await new Promise((r) => setTimeout(r, 2000));
+      logger.info(
+        { sender, groupFolder, poolIndex: idx },
+        'Assigned and renamed pool bot',
+      );
+    } catch (err) {
+      logger.warn(
+        { sender, err },
+        'Failed to rename pool bot (sending anyway)',
+      );
+    }
+  }
+
+  const api = poolApis[idx];
+  try {
+    const numericId = chatId.replace(/^tg:/, '');
+    const MAX_LENGTH = 4096;
+    if (text.length <= MAX_LENGTH) {
+      await sendTelegramMessage(api, numericId, text);
+    } else {
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        await sendTelegramMessage(api, numericId, text.slice(i, i + MAX_LENGTH));
+      }
+    }
+    logger.info(
+      { chatId, sender, poolIndex: idx, length: text.length },
+      'Pool message sent',
+    );
+  } catch (err) {
+    logger.error({ chatId, sender, err }, 'Failed to send pool message');
   }
 }
 

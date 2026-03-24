@@ -389,9 +389,12 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
+  const modelOverride = process.env.CLAUDE_MODEL || undefined;
+
   for await (const message of query({
     prompt: stream,
     options: {
+      model: modelOverride,
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,

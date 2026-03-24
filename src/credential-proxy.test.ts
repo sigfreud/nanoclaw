@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import http from 'http';
 import type { AddressInfo } from 'net';
+import fs from 'fs';
 
 const mockEnv: Record<string, string> = {};
 vi.mock('./env.js', () => ({
@@ -10,6 +11,13 @@ vi.mock('./env.js', () => ({
 vi.mock('./logger.js', () => ({
   logger: { info: vi.fn(), error: vi.fn(), debug: vi.fn(), warn: vi.fn() },
 }));
+
+// Prevent readOAuthToken from reading the real ~/.claude/.credentials.json
+const origExistsSync = fs.existsSync;
+vi.spyOn(fs, 'existsSync').mockImplementation((p) => {
+  if (String(p).includes('.credentials.json')) return false;
+  return origExistsSync(p);
+});
 
 import { startCredentialProxy } from './credential-proxy.js';
 

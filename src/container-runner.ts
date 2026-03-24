@@ -8,6 +8,7 @@ import os from 'os';
 import path from 'path';
 
 import {
+  CLAUDE_MODEL,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -248,6 +249,11 @@ function buildContainerArgs(
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
   } else {
     args.push('-e', 'CLAUDE_CODE_OAUTH_TOKEN=placeholder');
+  }
+
+  // Pass model override if configured
+  if (CLAUDE_MODEL) {
+    args.push('-e', `CLAUDE_MODEL=${CLAUDE_MODEL}`);
   }
 
   // Runtime-specific args for host gateway resolution

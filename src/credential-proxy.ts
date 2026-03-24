@@ -10,12 +10,75 @@
  *             Proxy injects real OAuth token on that exchange request;
  *             subsequent requests carry the temp key which is valid as-is.
  */
+import { execFile } from 'child_process';
+import fs from 'fs';
 import { createServer, Server } from 'http';
 import { request as httpsRequest } from 'https';
 import { request as httpRequest, RequestOptions } from 'http';
+import os from 'os';
+import path from 'path';
 
 import { readEnvFile } from './env.js';
 import { logger } from './logger.js';
+
+const CREDENTIALS_PATH = path.join(
+  process.env.HOME || os.homedir(),
+  '.claude',
+  '.credentials.json',
+);
+
+const REFRESH_SCRIPT = path.join(
+  import.meta.dirname,
+  '..',
+  'scripts',
+  'refresh-oauth-token.sh',
+);
+
+let refreshInFlight = false;
+
+/**
+ * Read the OAuth access token from ~/.claude/.credentials.json.
+ * Falls back to .env if the file doesn't exist.
+ * This is re-read on every request so token refreshes by `claude` CLI are picked up automatically.
+ * If the token is near expiry (<1 hour), triggers an async refresh.
+ */
+function readOAuthToken(envFallback?: string): string | undefined {
+  try {
+    if (fs.existsSync(CREDENTIALS_PATH)) {
+      const creds = JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf-8'));
+      const token = creds?.claudeAiOauth?.accessToken;
+      const expiresAt = creds?.claudeAiOauth?.expiresAt;
+
+      // Proactively trigger refresh if token expires within 1 hour
+      if (expiresAt && Date.now() > expiresAt - 3_600_000) {
+        triggerRefresh();
+      }
+
+      if (token) return token;
+    }
+  } catch (err) {
+    logger.debug({ err }, 'Failed to read credentials.json, using .env fallback');
+  }
+  return envFallback;
+}
+
+/** Spawn the refresh script asynchronously (at most one at a time). */
+function triggerRefresh(): void {
+  if (refreshInFlight) return;
+  if (!fs.existsSync(REFRESH_SCRIPT)) return;
+
+  refreshInFlight = true;
+  logger.info('OAuth token near expiry, triggering proactive refresh');
+
+  execFile('bash', [REFRESH_SCRIPT], { timeout: 120_000 }, (err, stdout, stderr) => {
+    refreshInFlight = false;
+    if (err) {
+      logger.warn({ err, stderr }, 'Proactive token refresh failed');
+    } else {
+      logger.info({ stdout: stdout.trim() }, 'Proactive token refresh completed');
+    }
+  });
+}
 
 export type AuthMode = 'api-key' | 'oauth';
 
@@ -35,7 +98,7 @@ export function startCredentialProxy(
   ]);
 
   const authMode: AuthMode = secrets.ANTHROPIC_API_KEY ? 'api-key' : 'oauth';
-  const oauthToken =
+  const oauthTokenFallback =
     secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.ANTHROPIC_AUTH_TOKEN;
 
   const upstreamUrl = new URL(
@@ -73,8 +136,9 @@ export function startCredentialProxy(
           // x-api-key only, so they pass through without token injection.
           if (headers['authorization']) {
             delete headers['authorization'];
-            if (oauthToken) {
-              headers['authorization'] = `Bearer ${oauthToken}`;
+            const token = readOAuthToken(oauthTokenFallback);
+            if (token) {
+              headers['authorization'] = `Bearer ${token}`;
             }
           }
         }

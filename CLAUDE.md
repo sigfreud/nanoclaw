@@ -59,6 +59,33 @@ systemctl --user restart nanoclaw
 
 **WhatsApp not connecting after upgrade:** WhatsApp is now a separate channel fork, not bundled in core. Run `/add-whatsapp` (or `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git && git fetch whatsapp main && (git merge whatsapp/main || { git checkout --theirs package-lock.json && git add package-lock.json && git merge --continue; }) && npm run build`) to install it. Existing auth credentials and groups are preserved.
 
+## OAuth Token Refresh (Claude Max)
+
+When using Claude Max (consumer OAuth) instead of an API key, tokens expire every ~24 hours. Three safety nets keep them fresh:
+
+| Layer | Mechanism | Trigger |
+|-------|-----------|---------|
+| systemd timer | `scripts/refresh-oauth-token.sh` | Every 6 hours (`nanoclaw-token-refresh.timer`) |
+| Proxy proactive | `src/credential-proxy.ts` spawns refresh script | Token <1 hour from expiry |
+| Manual | `bash scripts/refresh-oauth-token.sh` | Run anytime |
+
+**How it works:** The credential proxy (`src/credential-proxy.ts`) re-reads `~/.claude/.credentials.json` on every request. Containers never see real tokens — they send placeholders that the proxy swaps for the real OAuth token before forwarding to Anthropic.
+
+**Check token state:**
+```bash
+python3 -c "import json,time; c=json.load(open('$HOME/.claude/.credentials.json')); print(f'{(c[\"claudeAiOauth\"][\"expiresAt\"]-time.time()*1000)/3600000:.1f}h remaining')"
+```
+
+**Force refresh:**
+```bash
+bash scripts/refresh-oauth-token.sh
+```
+
+**If both strategies in the script fail:**
+1. Check `systemctl --user status nanoclaw-token-refresh` for errors
+2. Try `claude -p "hi" --max-turns 1` to trigger CLI-internal refresh
+3. As last resort: `claude` login flow to get a fresh token
+
 ## Container Build Cache
 
 The container buildkit caches the build context aggressively. `--no-cache` alone does NOT invalidate COPY steps — the builder's volume retains stale files. To force a truly clean rebuild, prune the builder then re-run `./container/build.sh`.
