@@ -16,6 +16,17 @@ vi.mock('child_process', () => ({
   execSync: (...args: unknown[]) => mockExecSync(...args),
 }));
 
+// Mock fs so the WSL probe (fs.existsSync on /proc/.../WSLInterop) is controllable.
+// detectProxyBindHost() calls fs.existsSync at module-init, so the mock fn must
+// be created via vi.hoisted to exist before the factory runs.
+const { mockExistsSync } = vi.hoisted(() => ({
+  mockExistsSync: vi.fn<(p: unknown) => boolean>(() => false),
+}));
+vi.mock('fs', () => {
+  const api = { existsSync: mockExistsSync };
+  return { default: api, ...api };
+});
+
 import {
   CONTAINER_RUNTIME_BIN,
   readonlyMountArgs,
@@ -27,6 +38,7 @@ import { logger } from './logger.js';
 
 beforeEach(() => {
   vi.clearAllMocks();
+  mockExistsSync.mockReturnValue(false);
 });
 
 // --- Pure functions ---
@@ -64,7 +76,8 @@ describe('ensureContainerRuntimeRunning', () => {
     );
   });
 
-  it('throws when docker info fails', () => {
+  it('throws when docker info fails on non-WSL', () => {
+    mockExistsSync.mockReturnValue(false);
     mockExecSync.mockImplementationOnce(() => {
       throw new Error('Cannot connect to the Docker daemon');
     });
@@ -73,6 +86,54 @@ describe('ensureContainerRuntimeRunning', () => {
       'Container runtime is required but failed to start',
     );
     expect(logger.error).toHaveBeenCalled();
+    // Non-WSL: only the initial probe should have run — no launch, no poll.
+    expect(mockExecSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('on WSL, launches Docker Desktop and returns once runtime comes up', () => {
+    mockExistsSync.mockReturnValue(true); // /proc/.../WSLInterop present
+    mockExecSync
+      .mockImplementationOnce(() => {
+        throw new Error('Cannot connect to the Docker daemon'); // initial probe
+      })
+      .mockReturnValueOnce('') // powershell launch
+      .mockReturnValueOnce(''); // poll probe #1 succeeds
+
+    const sleep = vi.fn();
+    ensureContainerRuntimeRunning({ sleep });
+
+    expect(mockExecSync).toHaveBeenCalledTimes(3);
+    expect(mockExecSync).toHaveBeenNthCalledWith(
+      2,
+      expect.stringContaining('Docker Desktop.exe'),
+      expect.any(Object),
+    );
+    expect(sleep).toHaveBeenCalledWith(3000);
+    expect(logger.info).toHaveBeenCalledWith('Container runtime is now running');
+  });
+
+  it('on WSL, throws if Docker Desktop never comes up within the deadline', () => {
+    mockExistsSync.mockReturnValue(true);
+    // Every execSync call throws (initial probe, launch, every poll probe).
+    mockExecSync.mockImplementation(() => {
+      throw new Error('still down');
+    });
+
+    // Fake sleep that jumps Date.now() past the 90s deadline on the first call.
+    const realNow = Date.now;
+    let fakeOffset = 0;
+    vi.spyOn(Date, 'now').mockImplementation(() => realNow() + fakeOffset);
+    const sleep = vi.fn(() => {
+      fakeOffset += 100_000;
+    });
+
+    try {
+      expect(() => ensureContainerRuntimeRunning({ sleep })).toThrow(
+        'Container runtime is required but failed to start',
+      );
+    } finally {
+      vi.mocked(Date.now).mockRestore();
+    }
   });
 });
 

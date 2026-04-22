@@ -62,42 +62,104 @@ export function stopContainer(name: string): string {
   return `${CONTAINER_RUNTIME_BIN} stop ${name}`;
 }
 
-/** Ensure the container runtime is running, starting it if needed. */
-export function ensureContainerRuntimeRunning(): void {
+/** Returns true if docker info succeeds right now. */
+function isContainerRuntimeUp(): boolean {
   try {
     execSync(`${CONTAINER_RUNTIME_BIN} info`, {
       stdio: 'pipe',
       timeout: 10000,
     });
-    logger.debug('Container runtime already running');
-  } catch (err) {
-    logger.error({ err }, 'Failed to reach container runtime');
-    console.error(
-      '\n╔════════════════════════════════════════════════════════════════╗',
-    );
-    console.error(
-      '║  FATAL: Container runtime failed to start                      ║',
-    );
-    console.error(
-      '║                                                                ║',
-    );
-    console.error(
-      '║  Agents cannot run without a container runtime. To fix:        ║',
-    );
-    console.error(
-      '║  1. Ensure Docker is installed and running                     ║',
-    );
-    console.error(
-      '║  2. Run: docker info                                           ║',
-    );
-    console.error(
-      '║  3. Restart NanoClaw                                           ║',
-    );
-    console.error(
-      '╚════════════════════════════════════════════════════════════════╝\n',
-    );
-    throw new Error('Container runtime is required but failed to start');
+    return true;
+  } catch {
+    return false;
   }
+}
+
+/**
+ * On WSL, Docker Desktop is a Windows app. If the runtime is unreachable,
+ * launching it via WSL→Windows interop can recover without operator action.
+ * No-op on other platforms.
+ */
+function launchDockerDesktopOnWSL(): void {
+  execSync(
+    'powershell.exe -NoProfile -Command "Start-Process -FilePath \\"C:\\Program Files\\Docker\\Docker\\Docker Desktop.exe\\""',
+    { stdio: 'pipe', timeout: 10000 },
+  );
+}
+
+function defaultSleep(ms: number): void {
+  // Synchronous sleep — ensureContainerRuntimeRunning runs at boot, not in a hot path.
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    /* spin */
+  }
+}
+
+/**
+ * Ensure the container runtime is running, starting it if needed.
+ *
+ * WSL auto-recovery: if the runtime is down, we probe for WSL and try to launch
+ * Docker Desktop via interop before giving up. The `sleep` hook exists so tests
+ * can skip the poll delay; production code calls with no args.
+ */
+export function ensureContainerRuntimeRunning(hooks: {
+  sleep?: (ms: number) => void;
+} = {}): void {
+  if (isContainerRuntimeUp()) {
+    logger.debug('Container runtime already running');
+    return;
+  }
+
+  const sleep = hooks.sleep ?? defaultSleep;
+  const isWSL = fs.existsSync('/proc/sys/fs/binfmt_misc/WSLInterop');
+
+  if (isWSL) {
+    logger.info(
+      'Container runtime unreachable; attempting to launch Docker Desktop via WSL interop',
+    );
+    try {
+      launchDockerDesktopOnWSL();
+    } catch (err) {
+      logger.warn({ err }, 'Failed to launch Docker Desktop');
+    }
+
+    // Docker Desktop cold-start on WSL can take ~30–60s.
+    const deadline = Date.now() + 90_000;
+    while (Date.now() < deadline) {
+      sleep(3000);
+      if (isContainerRuntimeUp()) {
+        logger.info('Container runtime is now running');
+        return;
+      }
+    }
+  }
+
+  logger.error('Failed to reach container runtime');
+  console.error(
+    '\n╔════════════════════════════════════════════════════════════════╗',
+  );
+  console.error(
+    '║  FATAL: Container runtime failed to start                      ║',
+  );
+  console.error(
+    '║                                                                ║',
+  );
+  console.error(
+    '║  Agents cannot run without a container runtime. To fix:        ║',
+  );
+  console.error(
+    '║  1. Ensure Docker is installed and running                     ║',
+  );
+  console.error(
+    '║  2. Run: docker info                                           ║',
+  );
+  console.error(
+    '║  3. Restart NanoClaw                                           ║',
+  );
+  console.error(
+    '╚════════════════════════════════════════════════════════════════╝\n',
+  );
+  throw new Error('Container runtime is required but failed to start');
 }
 
 /** Kill orphaned NanoClaw containers from previous runs. */
