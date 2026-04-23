@@ -64,16 +64,18 @@ All mutable state that is not tracked in git was archived before the upgrade. Do
   - `groups/` — all per-group state and memory files.
   - `env-snapshot` — copy of `.env` at snapshot time.
   - `MANIFEST.sha256` — per-file sha256 of all 2161 files.
-- **Manifest rollup sha256:** `c944d14638851dc178ef1057436fac0ccce6807a01bdc41a0b102cf05b1c29b0`
+- **Manifest rollup sha256 (after resume-summary regeneration):** `698eeb265cc5fdc0b32261fba028a89415c4fe24efc4ae28ed05d57ea10aa6c4`
+  - Original manifest (pre-summaries): `c944d14638851dc178ef1057436fac0ccce6807a01bdc41a0b102cf05b1c29b0`
+  - 2161 → 2162 files; the added file is one synthesized CLAUDE.md per empty-memory group (see below).
 
 Per-group CLAUDE.md presence at snapshot:
-- `global` — 77 lines
-- `main` — 250 lines (primary context payload)
-- `telegram_main` — 53 lines
-- `telegram_noctua-swarm` — none (empty memory)
-- `whatsapp_main` — none (empty memory)
+- `global` — 77 lines (pre-existing)
+- `main` — 250 lines (pre-existing, primary context payload)
+- `telegram_main` — 53 lines (pre-existing)
+- `telegram_noctua-swarm` — **synthesized 2026-04-23** from last 5 messages in `messages.db` (874 B). Original was empty.
+- `whatsapp_main` — **synthesized 2026-04-23** from last 30 messages in `messages.db` (6.6 KB). Original was empty.
 
-Empty-memory groups' historical context (if needed) can be reconstructed from `messages.db` in the archive.
+The synthesized files give NanoClaw immediate resume context after the upgrade without having to read the DB. Full history for all groups is in `messages.db` in the archive if deeper context is needed.
 
 ## Rollback procedure (from any future state back to this snapshot)
 
