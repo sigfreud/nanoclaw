@@ -89,7 +89,18 @@ bash scripts/recover-nanoclaw.sh
 
 Idempotent. Probes Docker → launches Docker Desktop if down → waits → restarts `nanoclaw.service` → tails the log for the `NanoClaw running` banner. Works from inside WSL, or from a Windows shell via `wsl.exe -d Ubuntu --user $USER bash /path/to/script`.
 
-**Remote recovery gotcha (WSL + Windows):** Tailscale SSH *server* is Linux-only — running `tailscale set --ssh=true` on the Windows node returns *"not supported on windows"*. For SSH access over Tailscale on this host you need Windows OpenSSH Server (`Add-WindowsCapability -Online -Name OpenSSH.Server*`, requires UAC) or RDP; both elevate. Don't waste time trying Tailscale SSH.
+**Remote SSH access over Tailscale (how it actually works on this host):** Tailscale SSH *server* is Linux-only, and Windows OpenSSH Server is NOT installed here (`Get-WindowsCapability -Online -Name OpenSSH.Server*` → `NotPresent`). Instead, SSH lands inside WSL via a port-forward:
+
+1. **WSL sshd** runs inside the Ubuntu distro, started by `/etc/wsl.conf` → `[boot] command=service ssh start` (SysV init) **and** redundantly by a Windows Task Scheduler task `StartWSL` (`wsl.exe -d Ubuntu -u root -- service ssh start`, trigger: at logon, RunLevel Highest).
+2. **Windows `netsh interface portproxy`** forwards `0.0.0.0:22 → 172.19.201.207:22` (WSL's `eth0`). Rule is persistent in the registry.
+3. **Windows firewall rule** `SSH for WSL` (inbound, Allow, all profiles) lets the connection reach the portproxy.
+4. **Tailscale on Windows** (`100.110.29.28 laptop-l5ic913g`) provides the routable IP — from any tailnet peer, `ssh sigfreud@100.110.29.28` is transparently NAT'd to Windows:22 → WSL:22.
+
+**Quirks worth remembering:**
+- `systemd ssh.socket` fails every boot with *"Address already in use"* because the SysV `service ssh start` grabbed port 22 first. Harmless — sshd is already running. Don't "fix" it by disabling the SysV path; the socket unit is known-broken in this config.
+- Inside an SSH session `SSH_CLIENT` shows `172.19.192.1` (the Windows vEthernet (WSL) adapter), **not the real remote IP** — side effect of the portproxy. Don't use it for audit/security decisions.
+- The portproxy destination is hardcoded to `172.19.201.207`. WSL's eth0 IP has been stable across reboots on this host, but a WSL update that changes the default subnet would silently break remote SSH until the rule is re-added (`netsh interface portproxy add v4tov4 listenport=22 listenaddress=0.0.0.0 connectport=22 connectaddress=<new-wsl-ip>`).
+- To inspect: `netsh interface portproxy show all` (from Windows/PowerShell), `ss -tlnp | grep :22` (from WSL).
 
 **Known limitation:** Docker Desktop sometimes refuses to launch from a non-interactive SSH session when no one is logged into the Windows console. If `powershell.exe Start-Process "Docker Desktop.exe"` returns 0 but `docker info` never succeeds inside the poll window, the fix is either (a) RDP in once to establish an interactive desktop, or (b) ensure `autoStart: true` so Docker comes up with Windows boot before anyone connects.
 
