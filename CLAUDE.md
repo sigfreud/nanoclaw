@@ -18,6 +18,8 @@ Single Node.js process with skill-based channel system. Channels (WhatsApp, Tele
 | `src/container-runner.ts` | Spawns agent containers with mounts |
 | `src/task-scheduler.ts` | Runs scheduled tasks |
 | `src/db.ts` | SQLite operations |
+| `src/container-runtime.ts` | Runtime abstraction. `ensureContainerRuntimeRunning` auto-launches Docker Desktop on WSL if the runtime is down |
+| `scripts/recover-nanoclaw.sh` | Idempotent one-shot recovery after outage / stuck state |
 | `groups/{name}/CLAUDE.md` | Per-group memory (isolated) |
 | `container/skills/agent-browser.md` | Browser automation tool (available to all agents via Bash) |
 
@@ -58,6 +60,38 @@ systemctl --user restart nanoclaw
 ## Troubleshooting
 
 **WhatsApp not connecting after upgrade:** WhatsApp is now a separate channel fork, not bundled in core. Run `/add-whatsapp` (or `git remote add whatsapp https://github.com/qwibitai/nanoclaw-whatsapp.git && git fetch whatsapp main && (git merge whatsapp/main || { git checkout --theirs package-lock.json && git add package-lock.json && git merge --continue; }) && npm run build`) to install it. Existing auth credentials and groups are preserved.
+
+**Crash loop / service won't stay up:** See [Auto-start & Recovery](#auto-start--recovery) below. The most common cause on WSL is Docker Desktop being stopped; the service now auto-launches it, but if that fails run `bash scripts/recover-nanoclaw.sh`.
+
+## Auto-start & Recovery
+
+NanoClaw is built to come back up on its own after a reboot or outage. The moving parts:
+
+| Layer | Setting | Why it matters |
+|-------|---------|----------------|
+| Windows | Docker Desktop `autoStart: true` in `%APPDATA%\Docker\settings.json` | Engine is up before the service probes it; avoids triggering the in-code fallback on every boot |
+| WSL | `loginctl Linger=yes` for the user | User systemd (and `nanoclaw.service`) runs without an active terminal session — survives SSH disconnect |
+| systemd | `nanoclaw.service` + `nanoclaw-token-refresh.timer` enabled | Service starts with the user slice and restarts on crash (`Restart=always`) |
+| Code | `ensureContainerRuntimeRunning()` in `src/container-runtime.ts` | On WSL, if `docker info` fails, launches Docker Desktop via `powershell.exe Start-Process` and polls for up to 90s before giving up |
+
+**Check it all at once:**
+```bash
+systemctl --user is-active nanoclaw.service          # expect: active
+loginctl show-user "$USER" --property=Linger          # expect: Linger=yes
+docker info --format '{{.ServerVersion}}'             # expect: a version string
+grep -oE '"autoStart":\s*(true|false)' "/mnt/c/Users/$(whoami)/AppData/Roaming/Docker/settings.json"
+```
+
+**Force recovery (safe to re-run at any time):**
+```bash
+bash scripts/recover-nanoclaw.sh
+```
+
+Idempotent. Probes Docker → launches Docker Desktop if down → waits → restarts `nanoclaw.service` → tails the log for the `NanoClaw running` banner. Works from inside WSL, or from a Windows shell via `wsl.exe -d Ubuntu --user $USER bash /path/to/script`.
+
+**Remote recovery gotcha (WSL + Windows):** Tailscale SSH *server* is Linux-only — running `tailscale set --ssh=true` on the Windows node returns *"not supported on windows"*. For SSH access over Tailscale on this host you need Windows OpenSSH Server (`Add-WindowsCapability -Online -Name OpenSSH.Server*`, requires UAC) or RDP; both elevate. Don't waste time trying Tailscale SSH.
+
+**Known limitation:** Docker Desktop sometimes refuses to launch from a non-interactive SSH session when no one is logged into the Windows console. If `powershell.exe Start-Process "Docker Desktop.exe"` returns 0 but `docker info` never succeeds inside the poll window, the fix is either (a) RDP in once to establish an interactive desktop, or (b) ensure `autoStart: true` so Docker comes up with Windows boot before anyone connects.
 
 ## OAuth Token Refresh (Claude Max)
 
