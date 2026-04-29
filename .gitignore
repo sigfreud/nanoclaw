@@ -28,6 +28,9 @@ groups/*
 # Temp files
 .tmp-*
 
+# WhatsApp pairing screenshots (transient setup artifacts)
+sync*.jpg
+
 # OS
 .DS_Store
 
