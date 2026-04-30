@@ -9,6 +9,7 @@ import type { AgentGroup } from './types.js';
 const DEFAULT_SETTINGS_JSON =
   JSON.stringify(
     {
+      model: 'claude-opus-4-7',
       env: {
         CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: '1',
         CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD: '1',
