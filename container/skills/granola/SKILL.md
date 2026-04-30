@@ -26,7 +26,6 @@ bash /workspace/agent/scripts/granola.sh <command> [args]
 | `folders` | list folders |
 | `folder-docs <folder_id> [N]` | meetings in a folder |
 | `shared-doc <meeting_id>` | alias for `get` |
-| `search-events`, `workspaces` | **unsupported** — error with exit 3 (no equivalent in official MCP) |
 
 **Output formats** (vary by tool — don't assume JSON):
 - `list` and `folder-docs` return XML-tagged text (`<meetings_data>...<meeting id="..." title="..." date="..."/>...`). Extract IDs with regex `/<meeting\s+id="([^"]+)"/g`.
