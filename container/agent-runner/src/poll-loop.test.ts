@@ -5,6 +5,8 @@ import { getPendingMessages, markCompleted } from './db/messages-in.js';
 import { getUndeliveredMessages } from './db/messages-out.js';
 import { formatMessages, extractRouting } from './formatter.js';
 import { MockProvider } from './providers/mock.js';
+import { pumpFollowups } from './poll-loop.js';
+import type { AgentQuery } from './providers/types.js';
 
 beforeEach(() => {
   initTestSessionDb();
@@ -189,6 +191,49 @@ describe('mock provider', () => {
     expect(results).toHaveLength(2);
     expect(results[0].text).toBe('Re: First');
     expect(results[1].text).toBe('Re: Second');
+  });
+});
+
+describe('hot-path pre-task scripts', () => {
+  function fakeQuery(pushed: string[]): AgentQuery {
+    return {
+      push: (p: string) => pushed.push(p),
+      end: () => {},
+      abort: () => {},
+      events: (async function* () {})(),
+    };
+  }
+
+  it('wakeAgent=true enriches the pushed prompt with Script output', async () => {
+    insertMessage('t1', 'task', {
+      prompt: 'Run the daily health check',
+      script: `echo '{"wakeAgent":true,"data":{"x":1}}'`,
+    });
+
+    const pushed: string[] = [];
+    await pumpFollowups(fakeQuery(pushed));
+
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]).toContain('Script output:');
+    expect(pushed[0]).toContain('"x": 1');
+    expect(pushed[0]).toContain('Run the daily health check');
+
+    // Row was marked completed — nothing left pending.
+    expect(getPendingMessages()).toHaveLength(0);
+  });
+
+  it('wakeAgent=false gates the task: not pushed but still completed', async () => {
+    insertMessage('t2', 'task', {
+      prompt: 'Should not wake the agent',
+      script: `echo '{"wakeAgent":false}'`,
+    });
+
+    const pushed: string[] = [];
+    await pumpFollowups(fakeQuery(pushed));
+
+    expect(pushed).toHaveLength(0);
+    // Gated, not left pending — host sweep must not see a stale claim.
+    expect(getPendingMessages()).toHaveLength(0);
   });
 });
 

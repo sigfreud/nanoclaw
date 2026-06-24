@@ -245,6 +245,63 @@ interface QueryResult {
   continuation?: string;
 }
 
+/**
+ * One follow-up poll pass: collect new pending messages, run any pre-task
+ * scripts, and push the survivors into the active query. Exported for tests.
+ *
+ * Mirrors the cold-path ordering in runPollLoop:
+ *   markProcessing → applyPreTaskScripts → markCompleted(skipped)
+ *   → formatMessages(keep) → query.push → markCompleted(keep ids)
+ *
+ * Every collected id ends up in exactly `keep` or `skipped`, so all rows are
+ * marked completed — no orphaned 'processing' claims left for the host sweep.
+ */
+export async function pumpFollowups(query: AgentQuery): Promise<void> {
+  // Skip system messages (MCP tool responses) and /clear (needs fresh query).
+  // Thread routing is the router's concern — if a message landed in this
+  // session, the agent should see it. Per-thread sessions already isolate
+  // threads into separate containers; shared sessions intentionally merge
+  // everything. Filtering on thread_id here caused deadlocks when the
+  // initial batch and follow-ups had mismatched thread_ids (e.g. a
+  // host-generated welcome trigger with null thread vs a Discord DM reply).
+  const newMessages = getPendingMessages().filter((m) => {
+    if (m.kind === 'system') return false;
+    if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
+    return true;
+  });
+  if (newMessages.length === 0) return;
+
+  const newIds = newMessages.map((m) => m.id);
+  markProcessing(newIds);
+
+  // Pre-task scripts: any task rows carrying a `script` run before the push.
+  // wakeAgent=false (or a script error) gates that task row only — surviving
+  // messages still go to the agent, enriched with their `scriptOutput`.
+  let keep: MessageInRow[] = newMessages;
+  let skipped: string[] = [];
+  // MODULE-HOOK:scheduling-pre-task:start
+  const { applyPreTaskScripts } = await import('./scheduling/task-script.js');
+  const preTask = await applyPreTaskScripts(newMessages);
+  keep = preTask.keep;
+  skipped = preTask.skipped;
+  if (skipped.length > 0) {
+    markCompleted(skipped);
+    log(`Pre-task script skipped ${skipped.length} follow-up task(s): ${skipped.join(', ')}`);
+  }
+  // MODULE-HOOK:scheduling-pre-task:end
+
+  if (keep.length === 0) {
+    log('All follow-up message(s) gated by script, nothing pushed');
+    return;
+  }
+
+  const prompt = formatMessages(keep);
+  log(`Pushing ${keep.length} follow-up message(s) into active query`);
+  query.push(prompt);
+
+  markCompleted(keep.map((m) => m.id));
+}
+
 async function processQuery(
   query: AgentQuery,
   routing: RoutingContext,
@@ -260,31 +317,22 @@ async function processQuery(
   // Stream liveness is decided host-side via the heartbeat file + processing
   // claim age (see src/host-sweep.ts); if something is truly stuck, the host
   // will kill the container and messages get reset to pending.
+  //
+  // Follow-ups now run pre-task scripts before being pushed (mirroring the
+  // cold path in runPollLoop) so a scheduled task firing mid-turn still gets
+  // its `Script output:` block. Because scripts run real bash (async), a tick
+  // can outlast the ACTIVE_POLL_INTERVAL_MS interval — the `pollInFlight`
+  // reentrancy guard serializes ticks so overlapping passes can't
+  // double-process a row or race the host on markProcessing/markCompleted.
+  let pollInFlight = false;
   const pollHandle = setInterval(() => {
-    if (done) return;
-
-    // Skip system messages (MCP tool responses) and /clear (needs fresh query).
-    // Thread routing is the router's concern — if a message landed in this
-    // session, the agent should see it. Per-thread sessions already isolate
-    // threads into separate containers; shared sessions intentionally merge
-    // everything. Filtering on thread_id here caused deadlocks when the
-    // initial batch and follow-ups had mismatched thread_ids (e.g. a
-    // host-generated welcome trigger with null thread vs a Discord DM reply).
-    const newMessages = getPendingMessages().filter((m) => {
-      if (m.kind === 'system') return false;
-      if ((m.kind === 'chat' || m.kind === 'chat-sdk') && isClearCommand(m)) return false;
-      return true;
-    });
-    if (newMessages.length > 0) {
-      const newIds = newMessages.map((m) => m.id);
-      markProcessing(newIds);
-
-      const prompt = formatMessages(newMessages);
-      log(`Pushing ${newMessages.length} follow-up message(s) into active query`);
-      query.push(prompt);
-
-      markCompleted(newIds);
-    }
+    if (done || pollInFlight) return;
+    pollInFlight = true;
+    pumpFollowups(query)
+      .catch((err) => log(`Follow-up poll error: ${err instanceof Error ? err.message : String(err)}`))
+      .finally(() => {
+        pollInFlight = false;
+      });
   }, ACTIVE_POLL_INTERVAL_MS);
 
   try {
